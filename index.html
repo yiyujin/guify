@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>p5.js Guify Tool</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
+  <link rel="stylesheet" href = "style.css" />
+</head>
+<body>
+  <div id="code-editor-container">
+    <h3 class = "caption">sketch.js</h3>
+    <div id="code-editor"></div>
+  </div>
+
+  <div style="max-width : 40px; height : 100%;">
+    <button id="runBtn" style="height : 100%;">▶︎</button>
+  </div>
+
+  <div id="canvas-container">
+    <h3 class = "caption">Preview</h3>
+  </div>
+
+  <div id="controls" style="flex : 0.75;">
+    <h3 class = "caption">Guify</h3>
+    
+    <button id="parseBtn">Parse Variables</button>
+    <br/>
+    <button id="guifyBtn">GUIfy</button>
+
+    <div id="active-gui-area">
+      <h3 class="caption">Active GUI</h3>
+    </div>
+
+    <div id="variable-list"></div>
+  </div>
+
+  <script>
+    let parsedVariables = [];
+    window.guiRegistry = window.guiRegistry || {};
+    const reactiveSketchVars = new Set();
+    const sketchVarStore = Object.create(null);
+    let activeP5Instance = null;
+
+    const initialCode = `let circleSize = 200;
+let circleColor = 'blue';
+let circleX = 200;
+let circleY = 200;
+
+function setup() {
+  createCanvas(400, 400);
+}
+
+function draw() {
+  background(220);
+  fill(circleColor);
+  noStroke();
+  circle(circleX, circleY, circleSize);
+}`;
+
+    let codeEditor = CodeMirror(document.getElementById('code-editor'), {
+      value: initialCode,
+      mode: 'javascript',
+      lineNumbers: true,
+      theme: 'default',
+      tabSize: 2,
+      indentWithTabs: false,
+      lineWrapping: true
+    });
+
+    function highlightGuifiedVariables() {
+      const guifiedVars = Object.keys(window.guiRegistry);
+      codeEditor.clearGutter('CodeMirror-linenumbers');
+      
+      guifiedVars.forEach(varName => {
+        const regex = new RegExp('\\b' + varName + '\\b', 'g');
+        const code = codeEditor.getValue();
+        let match;
+        while ((match = regex.exec(code)) !== null) {
+          const line = codeEditor.posFromIndex(match.index).line;
+          const start = codeEditor.posFromIndex(match.index);
+          const end = codeEditor.posFromIndex(match.index + varName.length);
+          codeEditor.markText(start, end, { className: 'guified-var' });
+        }
+      });
+    }
+
+    // --- Core Functions ---
+
+    function extractDeclaredVariableNames(code) {
+      const names = [];
+      const regex = /(?:let|var|const)\s+(\w+)\s*=\s*[^;]+;/g;
+      let match;
+      while ((match = regex.exec(code)) !== null) {
+        names.push(match[1]);
+      }
+      return names;
+    }
+
+    function readControlValue(control) {
+      if (!control) return control;
+      if (control.elt && control.elt.type === 'checkbox' && typeof control.checked === 'function') {
+        return control.checked();
+      }
+      return (typeof control.value === 'function') ? control.value() : control;
+    }
+
+    function writeControlValue(control, nextValue) {
+      if (!control) return;
+      if (control.elt && control.elt.type === 'checkbox' && typeof control.checked === 'function') {
+        control.checked(Boolean(nextValue));
+        return;
+      }
+      if (typeof control.value === 'function') {
+        control.value(nextValue);
+      }
+    }
+
+    function setupReactiveSketchGlobals(code) {
+      const names = extractDeclaredVariableNames(code);
+      names.forEach(varName => {
+        if (reactiveSketchVars.has(varName)) return;
+
+        const descriptor = Object.getOwnPropertyDescriptor(window, varName);
+        if (descriptor && descriptor.configurable === false) return;
+
+        if (Object.prototype.hasOwnProperty.call(window, varName)) {
+          sketchVarStore[varName] = window[varName];
+        }
+
+        Object.defineProperty(window, varName, {
+          configurable: true,
+          enumerable: true,
+          get() {
+            const guiEntry = window.guiRegistry[varName];
+            return guiEntry ? readControlValue(guiEntry.control) : sketchVarStore[varName];
+          },
+          set(nextValue) {
+            sketchVarStore[varName] = nextValue;
+            const guiEntry = window.guiRegistry[varName];
+            if (guiEntry) writeControlValue(guiEntry.control, nextValue);
+          }
+        });
+
+        reactiveSketchVars.add(varName);
+      });
+    }
+
+    function guify(varName, guiType, params) {
+      // 1. Preserve current value if already guified
+      let previousValue = undefined;
+      if (window.guiRegistry[varName]) {
+        previousValue = readControlValue(window.guiRegistry[varName].control);
+        window.guiRegistry[varName].container.remove();
+        delete window.guiRegistry[varName];
+      }
+
+      // 2. Create UI Wrapper
+      let container = createDiv();
+      container.parent('active-gui-area');
+      container.addClass('gui-row');
+      
+      let label = createSpan(varName);
+      label.addClass('gui-label');
+      label.parent(container);
+
+      // 3. Create p5 Control
+      let control;
+      switch (guiType.toLowerCase()) {
+        case "slider":
+          control = createSlider(...params);
+          break;
+        case "color":
+        case "colorpicker":
+          control = createColorPicker(...params);
+          break;
+        case "checkbox":
+          // Empty string first arg to prevent duplicate labels
+          control = createCheckbox('', params[0] === true);
+          break;
+      }
+      control.parent(container);
+
+      // 4. Create Value Text Display
+      let valDisplay = createSpan(readControlValue(control));
+      valDisplay.addClass('gui-val-text');
+      valDisplay.parent(container);
+
+      // Update text on interaction
+      control.input(() => {
+        valDisplay.html(readControlValue(control));
+        if (typeof window.redraw === 'function') {
+          window.redraw();
+        }
+      });
+
+      // 5. Register
+      window.guiRegistry[varName] = { control, container };
+      
+      // Set to preserved value if exists, otherwise use stored value or initial
+      if (previousValue !== undefined) {
+        writeControlValue(control, previousValue);
+        sketchVarStore[varName] = previousValue;
+        valDisplay.html(readControlValue(control));
+      } else if (typeof sketchVarStore[varName] !== 'undefined') {
+        writeControlValue(control, sketchVarStore[varName]);
+        valDisplay.html(readControlValue(control));
+      }
+    }
+
+    function runSketch() {
+      const code = codeEditor.getValue();
+      const canvasElements = document.querySelectorAll('canvas');
+      canvasElements.forEach(el => el.remove());
+
+      if (activeP5Instance && typeof activeP5Instance.remove === 'function') {
+        activeP5Instance.remove();
+        activeP5Instance = null;
+      }
+
+      setupReactiveSketchGlobals(code);
+      
+      if (window.noLoop) noLoop();
+
+      try {
+        let processedCode = code
+          .replace(/let /g, 'window.')
+          .replace(/const /g, 'window.')
+          .replace(/function\s+setup\b/, 'window.setup = function')
+          .replace(/function\s+draw\b/, 'window.draw = function');
+
+        eval(processedCode);
+        activeP5Instance = new p5();
+
+        const previewContainer = document.getElementById('canvas-container');
+        const latestCanvas = document.querySelector('canvas');
+        if (previewContainer && latestCanvas && !previewContainer.contains(latestCanvas)) {
+          previewContainer.appendChild(latestCanvas);
+        }
+        
+        // Sync GUI after code reload
+        guifySelectedVariables();
+        highlightGuifiedVariables();
+      } catch (error) {
+        console.error('Error running sketch:', error);
+      }
+    }
+
+    function parseSketchVariables() {
+      const code = codeEditor.getValue();
+      parsedVariables = [];
+      const varRegex = /(?:let|var|const)\s+(\w+)\s*=\s*([^;]+);/g;
+      let match;
+      
+      while ((match = varRegex.exec(code)) !== null) {
+        const varName = match[1];
+        const varValue = match[2].trim();
+        let type, value, guiType, params;
+        
+        if (!isNaN(varValue) && varValue !== '') {
+          type = 'number'; value = parseFloat(varValue);
+          guiType = 'slider'; params = `0, 400, ${value}, 1`;
+        } else if (varValue === 'true' || varValue === 'false') {
+          type = 'boolean'; value = varValue === 'true';
+          guiType = 'checkbox'; params = value.toString();
+        } else if (varValue.startsWith('"') || varValue.startsWith("'") || varValue.startsWith("#")) {
+          type = 'string'; value = varValue.replace(/['"]/g, '');
+          guiType = 'color'; params = varValue;
+        } else { continue; }
+        
+        parsedVariables.push({ name: varName, type, value, selected: !!window.guiRegistry[varName], guiType, params });
+      }
+      displayVariables();
+    }
+
+    function displayVariables() {
+        const listDiv = document.getElementById('variable-list');
+        
+        parsedVariables.forEach((varObj, index) => {
+            const itemDiv = document.createElement('div');
+            itemDiv.className = 'variable-item';
+            itemDiv.innerHTML = `
+            <div style="display: flex; align-items: center;">
+                <input type="checkbox" id="var-${index}" ${varObj.selected ? 'checked' : ''}>
+                <label for="var-${index}">${varObj.name}</label>
+            </div>
+            <span class="variable-meta">
+                Type: <span class="type-badge">${varObj.type}</span> | 
+                Initial: <span style="">${varObj.value}</span>
+            </span>
+            <div class="variable-details">
+                <select id="guiType-${index}">
+                <option value="slider" ${varObj.guiType === 'slider' ? 'selected' : ''}>slider</option>
+                <option value="color" ${varObj.guiType === 'color' ? 'selected' : ''}>color</option>
+                <option value="checkbox" ${varObj.guiType === 'checkbox' ? 'selected' : ''}>checkbox</option>
+                </select>
+                <input type="text" id="params-${index}" value="${varObj.params}">
+            </div>
+            `;
+            listDiv.appendChild(itemDiv);
+            
+            // Listeners remain the same
+            document.getElementById(`var-${index}`).addEventListener('change', (e) => parsedVariables[index].selected = e.target.checked);
+            document.getElementById(`guiType-${index}`).addEventListener('change', (e) => parsedVariables[index].guiType = e.target.value);
+            document.getElementById(`params-${index}`).addEventListener('input', (e) => parsedVariables[index].params = e.target.value);
+        });
+    }
+
+    function guifySelectedVariables() {
+      parsedVariables.forEach(varObj => {
+        if (varObj.selected) {
+          let paramsArray;
+          try {
+            paramsArray = eval('[' + varObj.params + ']');
+            guify(varObj.name, varObj.guiType, paramsArray);
+          } catch (e) { console.error('Params error', e); }
+        } else {
+          // REMOVAL LOGIC
+          if (window.guiRegistry[varObj.name]) {
+            window.guiRegistry[varObj.name].container.remove();
+            delete window.guiRegistry[varObj.name];
+            // Revert global to its static parsed value
+            window[varObj.name] = varObj.value;
+          }
+        }
+      });
+    }
+
+    // --- Events ---
+    document.getElementById('runBtn').addEventListener('click', () => {
+      runSketch();
+    });
+    document.getElementById('parseBtn').addEventListener('click', parseSketchVariables);
+    document.getElementById('guifyBtn').addEventListener('click', () => {
+      guifySelectedVariables();
+      highlightGuifiedVariables();
+    });
+
+    window.addEventListener('load', () => {
+      setTimeout(() => {
+        runSketch();
+        highlightGuifiedVariables();
+      }, 100);
+    });
+
+    function getValue(v) {
+      return readControlValue(v);
+    }
+  </script>
+</body>
+</html>

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>p5.js Guify Tool</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.js"></script>
+  <script src="../guify-core.js"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.css">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.2/mode/javascript/javascript.min.js"></script>
@@ -41,8 +42,7 @@
   <script>
     let parsedVariables = [];
     window.guiRegistry = window.guiRegistry || {};
-    const reactiveSketchVars = new Set();
-    const sketchVarStore = Object.create(null);
+    const guifyCore = window.Guify;
     let activeP5Instance = null;
 
     const initialCode = `let circleSize = 200;
@@ -88,129 +88,6 @@ function draw() {
       });
     }
 
-    // --- Core Functions ---
-
-    function extractDeclaredVariableNames(code) {
-      const names = [];
-      const regex = /(?:let|var|const)\s+(\w+)\s*=\s*[^;]+;/g;
-      let match;
-      while ((match = regex.exec(code)) !== null) {
-        names.push(match[1]);
-      }
-      return names;
-    }
-
-    function readControlValue(control) {
-      if (!control) return control;
-      if (control.elt && control.elt.type === 'checkbox' && typeof control.checked === 'function') {
-        return control.checked();
-      }
-      return (typeof control.value === 'function') ? control.value() : control;
-    }
-
-    function writeControlValue(control, nextValue) {
-      if (!control) return;
-      if (control.elt && control.elt.type === 'checkbox' && typeof control.checked === 'function') {
-        control.checked(Boolean(nextValue));
-        return;
-      }
-      if (typeof control.value === 'function') {
-        control.value(nextValue);
-      }
-    }
-
-    function setupReactiveSketchGlobals(code) {
-      const names = extractDeclaredVariableNames(code);
-      names.forEach(varName => {
-        if (reactiveSketchVars.has(varName)) return;
-
-        const descriptor = Object.getOwnPropertyDescriptor(window, varName);
-        if (descriptor && descriptor.configurable === false) return;
-
-        if (Object.prototype.hasOwnProperty.call(window, varName)) {
-          sketchVarStore[varName] = window[varName];
-        }
-
-        Object.defineProperty(window, varName, {
-          configurable: true,
-          enumerable: true,
-          get() {
-            const guiEntry = window.guiRegistry[varName];
-            return guiEntry ? readControlValue(guiEntry.control) : sketchVarStore[varName];
-          },
-          set(nextValue) {
-            sketchVarStore[varName] = nextValue;
-            const guiEntry = window.guiRegistry[varName];
-            if (guiEntry) writeControlValue(guiEntry.control, nextValue);
-          }
-        });
-
-        reactiveSketchVars.add(varName);
-      });
-    }
-
-    function guify(varName, guiType, params) {
-      // 1. Preserve current value if already guified
-      let previousValue = undefined;
-      if (window.guiRegistry[varName]) {
-        previousValue = readControlValue(window.guiRegistry[varName].control);
-        window.guiRegistry[varName].container.remove();
-        delete window.guiRegistry[varName];
-      }
-
-      // 2. Create UI Wrapper
-      let container = createDiv();
-      container.parent('active-gui-area');
-      container.addClass('gui-row');
-      
-      let label = createSpan(varName);
-      label.addClass('gui-label');
-      label.parent(container);
-
-      // 3. Create p5 Control
-      let control;
-      switch (guiType.toLowerCase()) {
-        case "slider":
-          control = createSlider(...params);
-          break;
-        case "color":
-        case "colorpicker":
-          control = createColorPicker(...params);
-          break;
-        case "checkbox":
-          // Empty string first arg to prevent duplicate labels
-          control = createCheckbox('', params[0] === true);
-          break;
-      }
-      control.parent(container);
-
-      // 4. Create Value Text Display
-      let valDisplay = createSpan(readControlValue(control));
-      valDisplay.addClass('gui-val-text');
-      valDisplay.parent(container);
-
-      // Update text on interaction
-      control.input(() => {
-        valDisplay.html(readControlValue(control));
-        if (typeof window.redraw === 'function') {
-          window.redraw();
-        }
-      });
-
-      // 5. Register
-      window.guiRegistry[varName] = { control, container };
-      
-      // Set to preserved value if exists, otherwise use stored value or initial
-      if (previousValue !== undefined) {
-        writeControlValue(control, previousValue);
-        sketchVarStore[varName] = previousValue;
-        valDisplay.html(readControlValue(control));
-      } else if (typeof sketchVarStore[varName] !== 'undefined') {
-        writeControlValue(control, sketchVarStore[varName]);
-        valDisplay.html(readControlValue(control));
-      }
-    }
-
     function runSketch() {
       const code = codeEditor.getValue();
       const canvasElements = document.querySelectorAll('canvas');
@@ -221,7 +98,7 @@ function draw() {
         activeP5Instance = null;
       }
 
-      setupReactiveSketchGlobals(code);
+      guifyCore.setupReactiveSketchGlobals(code);
       
       if (window.noLoop) noLoop();
 
@@ -315,16 +192,10 @@ function draw() {
           let paramsArray;
           try {
             paramsArray = eval('[' + varObj.params + ']');
-            guify(varObj.name, varObj.guiType, paramsArray);
+            guifyCore.guify(varObj.name, varObj.guiType, paramsArray);
           } catch (e) { console.error('Params error', e); }
         } else {
-          // REMOVAL LOGIC
-          if (window.guiRegistry[varObj.name]) {
-            window.guiRegistry[varObj.name].container.remove();
-            delete window.guiRegistry[varObj.name];
-            // Revert global to its static parsed value
-            window[varObj.name] = varObj.value;
-          }
+          guifyCore.remove(varObj.name, varObj.value);
         }
       });
     }
@@ -347,7 +218,7 @@ function draw() {
     });
 
     function getValue(v) {
-      return readControlValue(v);
+      return guifyCore.getValue(v);
     }
   </script>
 </body>
